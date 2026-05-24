@@ -7,18 +7,19 @@ python-multipart==0.0.9
 sqlalchemy==2.0.36
 supabase==2.9.0
 
-
 # Auth
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 python-dotenv==1.0.1
 
-# Face recognition
-deepface==0.0.93
+# Face recognition (lightweight — no TensorFlow)
+insightface==0.7.3
+onnxruntime==1.19.2
 opencv-python-headless==4.10.0.84
-mediapipe==0.10.35
-numpy>=1.26.0
+numpy>=1.23.0,<1.27.0
 Pillow>=10.4.0
+
+# Settings
 pydantic-settings==2.4.0
 
 # Encryption (face embeddings)

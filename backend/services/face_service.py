@@ -2,11 +2,10 @@
 Face Service
 ============
 Handles:
-  1. Liveness detection  — blink + head-turn challenge via MediaPipe
-  2. Face embedding      — ArcFace 512-dim vector via DeepFace
-  3. Embedding encryption — AES-256-GCM (nonce + tag + ciphertext, base64-encoded)
-  4. Face matching       — cosine similarity against stored embedding
-  5. Portrait blur       — MediaPipe selfie segmentation for clean face isolation
+  1. Face embedding      — ArcFace 512-dim vector via InsightFace (ONNX, no TensorFlow)
+  2. Embedding encryption — AES-256-GCM (nonce + tag + ciphertext, base64-encoded)
+  3. Face matching       — cosine similarity against stored embedding
+  4. Registration frame validation — needs ≥3/5 valid frames
 """
 
 import cv2
@@ -16,7 +15,6 @@ import json
 from io import BytesIO
 from PIL import Image
 from typing import Optional
-from deepface import DeepFace
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 from core.config import get_settings
@@ -24,14 +22,23 @@ from core.config import get_settings
 settings = get_settings()
 
 # ── Constants ──────────────────────────────────────────────────────────
-MATCH_THRESHOLD    = 0.68   # cosine similarity — above = same person
-CONFIDENCE_MIN     = 0.50   # below this → flag for teacher review
-MODEL_NAME         = "ArcFace"
+MATCH_THRESHOLD = 0.68   # cosine similarity — above = same person
+CONFIDENCE_MIN  = 0.50   # below this → flag for teacher review
 
-# opencv is most lenient — good for registration
-# retinaface is more accurate but strict — use for attendance matching
-DETECTOR_BACKEND        = "opencv"
-DETECTOR_BACKEND_STRICT = "retinaface"
+# ── InsightFace app (lazy-loaded once) ────────────────────────────────
+_app = None
+
+def _get_app():
+    global _app
+    if _app is None:
+        import insightface
+        from insightface.app import FaceAnalysis
+        _app = FaceAnalysis(
+            name='buffalo_sc',          # lightweight ArcFace model (~100MB)
+            providers=['CPUExecutionProvider'],
+        )
+        _app.prepare(ctx_id=-1, det_size=(640, 640))
+    return _app
 
 
 # ── Encryption helpers ─────────────────────────────────────────────────
@@ -41,7 +48,7 @@ def _get_key() -> bytes:
     return bytes.fromhex(settings.embedding_encryption_key)
 
 
-def encrypt_embedding(embedding: list[float]) -> str:
+def encrypt_embedding(embedding: list) -> str:
     """
     AES-256-GCM encrypt the embedding vector.
     Returns base64(nonce[16] + tag[16] + ciphertext).
@@ -55,7 +62,7 @@ def encrypt_embedding(embedding: list[float]) -> str:
     return base64.b64encode(packed).decode()
 
 
-def decrypt_embedding(encrypted: str) -> list[float]:
+def decrypt_embedding(encrypted: str) -> list:
     """Reverse of encrypt_embedding — returns the original float list."""
     key    = _get_key()
     packed = base64.b64decode(encrypted.encode())
@@ -80,23 +87,32 @@ def bgr_to_pil(bgr: np.ndarray) -> Image.Image:
     return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
 
-# ── Portrait blur ──────────────────────────────────────────────────────
+# ── Portrait blur (simple fallback without mediapipe) ──────────────────
 
 def apply_portrait_blur(bgr: np.ndarray, blur_strength: int = 35) -> np.ndarray:
     """
-    Use MediaPipe selfie segmentation to blur the background while
-    keeping the face/person sharp — like a portrait photo.
+    Simple face-region portrait effect without mediapipe.
+    Detects face bounding box, blurs everything outside it.
     """
     try:
-        import mediapipe as mp
-        mp_seg = mp.solutions.selfie_segmentation
+        app   = _get_app()
+        faces = app.get(bgr)
+        if not faces:
+            return bgr
 
-        with mp_seg.SelfieSegmentation(model_selection=1) as seg:
-            rgb    = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            result = seg.process(rgb)
-            mask   = result.segmentation_mask   # float32, 0-1
+        # Build mask from face bounding box (expanded slightly)
+        mask = np.zeros(bgr.shape[:2], dtype=np.float32)
+        for face in faces:
+            x1, y1, x2, y2 = [int(v) for v in face.bbox]
+            pad = int((y2 - y1) * 0.3)
+            x1 = max(0, x1 - pad)
+            y1 = max(0, y1 - pad)
+            x2 = min(bgr.shape[1], x2 + pad)
+            y2 = min(bgr.shape[0], y2 + pad)
+            mask[y1:y2, x1:x2] = 1.0
 
         # Smooth mask edges
+        mask     = cv2.GaussianBlur(mask, (51, 51), 0)
         mask_3ch = np.stack([mask] * 3, axis=-1)
         blurred  = cv2.GaussianBlur(bgr, (blur_strength | 1, blur_strength | 1), 0)
         output   = (bgr * mask_3ch + blurred * (1 - mask_3ch)).astype(np.uint8)
@@ -108,36 +124,37 @@ def apply_portrait_blur(bgr: np.ndarray, blur_strength: int = 35) -> np.ndarray:
 
 # ── Face embedding ─────────────────────────────────────────────────────
 
-def extract_embedding(bgr: np.ndarray, strict: bool = False) -> list[float]:
+def extract_embedding(bgr: np.ndarray, strict: bool = False) -> list:
     """
-    Extract an ArcFace 512-dim embedding from an image.
+    Extract an ArcFace 512-dim embedding from an image using InsightFace.
     Raises ValueError if no face detected or multiple faces found.
-    Uses 'opencv' detector by default (lenient) for registration,
-    'retinaface' when strict=True (for attendance matching).
+
+    strict=True raises on low detection score (used for attendance matching).
+    strict=False is more lenient (used for registration).
     """
-    rgb      = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    backend  = DETECTOR_BACKEND_STRICT if strict else DETECTOR_BACKEND
+    app   = _get_app()
+    faces = app.get(bgr)
 
-    try:
-        result = DeepFace.represent(
-            img_path         = rgb,
-            model_name       = MODEL_NAME,
-            detector_backend = backend,
-            enforce_detection= True,
-            align            = True,
-        )
-    except Exception as e:
-        raise ValueError(f"Face detection failed: {str(e)}")
-
-    if len(result) == 0:
-        raise ValueError("No face detected in image")
-    if len(result) > 1:
+    if len(faces) == 0:
+        raise ValueError("No face detected — ensure good lighting and face the camera directly")
+    if len(faces) > 1:
         raise ValueError("Multiple faces detected — only one face per frame allowed")
 
-    return result[0]["embedding"]   # list of 512 floats
+    face = faces[0]
+
+    # Detection confidence check
+    det_score = float(face.det_score) if hasattr(face, 'det_score') else 1.0
+    if strict and det_score < 0.6:
+        raise ValueError(f"Face detection confidence too low ({det_score:.2f}) — please face the camera directly")
+
+    if face.embedding is None:
+        raise ValueError("Could not extract face embedding")
+
+    embedding = face.embedding.tolist()   # 512-dim float list
+    return embedding
 
 
-def average_embeddings(embeddings: list[list[float]]) -> list[float]:
+def average_embeddings(embeddings: list) -> list:
     """Average multiple embeddings into one representative vector."""
     arr = np.array(embeddings, dtype=np.float32)
     avg = arr.mean(axis=0)
@@ -148,16 +165,16 @@ def average_embeddings(embeddings: list[list[float]]) -> list[float]:
 
 # ── Face matching ──────────────────────────────────────────────────────
 
-def cosine_similarity(a: list[float], b: list[float]) -> float:
+def cosine_similarity(a: list, b: list) -> float:
     va = np.array(a, dtype=np.float32)
     vb = np.array(b, dtype=np.float32)
     return float(np.dot(va, vb) / (np.linalg.norm(va) * np.linalg.norm(vb) + 1e-10))
 
 
 def match_face(
-    live_embedding: list[float],
+    live_embedding: list,
     stored_encrypted: str,
-) -> tuple[bool, float]:
+) -> tuple:
     """
     Decrypt stored embedding and compare with live embedding.
     Returns (is_match, confidence_score).
@@ -172,19 +189,14 @@ def match_face(
 def check_face_present(bgr: np.ndarray) -> bool:
     """Quick check — is there exactly one face in the frame?"""
     try:
-        result = DeepFace.represent(
-            img_path         = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB),
-            model_name       = MODEL_NAME,
-            detector_backend = DETECTOR_BACKEND,
-            enforce_detection= True,
-            align            = True,
-        )
-        return len(result) == 1
+        app   = _get_app()
+        faces = app.get(bgr)
+        return len(faces) == 1
     except Exception:
         return False
 
 
-def validate_registration_frames(frames_bytes: list[bytes]) -> list[list[float]]:
+def validate_registration_frames(frames_bytes: list) -> list:
     """
     Process up to 5 registration frames.
     - Skips frames where face detection fails (instead of hard-failing)
