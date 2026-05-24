@@ -10,3 +10,7 @@ __pycache__/
 node_modules/
 dist/
 .DS_Store
+.DS_Store
+__pycache__/
+*.bak
+smart-attendence-using-facerecognition/
