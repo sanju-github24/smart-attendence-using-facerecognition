@@ -22,9 +22,16 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins =[settings.frontend_url, "http://localhost:3000", "http://localhost:5173", "https://smart-attendence-using-facerecognit.vercel.app"],
-    allow_methods =["*"],
-    allow_headers =["*"],
+    allow_origins=[
+        settings.frontend_url,
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://smart-attendence-using-facerecognit.vercel.app",       # old/short
+        "https://smart-attendence-using-facerecognition.vercel.app",    # ← add full URL
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(auth.router)
