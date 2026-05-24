@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# ── SmartAttend Backend — Quick Start ──────────────────────────────────
+set -e
+
+echo "🎓 SmartAttend Backend Setup"
+echo "────────────────────────────"
+
+# 1. Create .env if missing
+if [ ! -f .env ]; then
+    cp .env.example .env
+
+    # Generate a random SECRET_KEY
+    SECRET=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+    sed -i "s/change-this-to-a-long-random-string-min-32-chars/$SECRET/" .env
+
+    # Generate a random EMBEDDING_ENCRYPTION_KEY (32 bytes = 64 hex chars)
+    ENC_KEY=$(python3 -c "from Crypto.Random import get_random_bytes; print(get_random_bytes(32).hex())")
+    sed -i "s/change-this-to-32-byte-hex-string/$ENC_KEY/" .env
+
+    echo "✅ .env created with auto-generated keys"
+    echo "⚠️  Update DATABASE_URL and ALLOWED_SUBNETS in .env before running in production"
+else
+    echo "✅ .env already exists"
+fi
+
+# 2. Install dependencies
+echo ""
+echo "📦 Installing dependencies..."
+pip install -r requirements.txt -q
+
+# 3. Start server
+echo ""
+echo "🚀 Starting server on http://localhost:8000"
+echo "📖 API docs at http://localhost:8000/docs"
+echo ""
+uvicorn main:app --reload --host 0.0.0.0 --port 8000

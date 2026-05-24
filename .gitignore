@@ -1,0 +1,12 @@
+# Never commit these
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.pth
+*.pt
+*.onnx
+node_modules/
+dist/
+.DS_Store

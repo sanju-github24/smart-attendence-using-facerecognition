@@ -1,0 +1,129 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Mono:wght@400;500&display=swap');
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       #0d0f14;
+  --surface:  #161921;
+  --surface2: #1e222d;
+  --border:   #272b38;
+  --text:     #e8eaf0;
+  --muted:    #6b7280;
+  --accent:   #6ee7b7;
+  --accent2:  #818cf8;
+  --warn:     #fbbf24;
+  --danger:   #f87171;
+  --radius:   14px;
+  --shadow:   0 4px 32px rgba(0,0,0,.45);
+}
+
+body {
+  font-family: 'DM Sans', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 9px; }
+
+input, select, textarea {
+  font-family: inherit;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: .925rem;
+  outline: none;
+  width: 100%;
+  transition: border .2s;
+}
+input:focus, select:focus { border-color: var(--accent2); }
+
+button {
+  font-family: 'DM Sans', sans-serif;
+  cursor: pointer;
+  border: none;
+  border-radius: 10px;
+  font-size: .9rem;
+  font-weight: 500;
+  transition: all .18s;
+}
+button:active { transform: scale(.97); }
+button:disabled { opacity: .6; cursor: not-allowed; }
+
+.btn-primary { background: var(--accent2); color: #fff; padding: 11px 22px; }
+.btn-primary:hover:not(:disabled) { filter: brightness(1.15); }
+
+.btn-accent { background: var(--accent); color: #0d0f14; padding: 11px 22px; font-weight: 600; }
+.btn-accent:hover:not(:disabled) { filter: brightness(1.1); }
+
+.btn-ghost { background: var(--surface2); color: var(--text); padding: 10px 18px; border: 1px solid var(--border); }
+.btn-ghost:hover { border-color: var(--accent2); color: var(--accent2); }
+
+.btn-danger { background: rgba(248,113,113,.15); color: var(--danger); padding: 9px 16px; border: 1px solid rgba(248,113,113,.3); }
+.btn-danger:hover { background: rgba(248,113,113,.25); }
+
+.btn-success { background: rgba(110,231,183,.15); color: var(--accent); padding: 9px 16px; border: 1px solid rgba(110,231,183,.3); }
+.btn-success:hover { background: rgba(110,231,183,.25); }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 22px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: .75rem;
+  font-weight: 500;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-family: 'DM Mono', monospace;
+}
+.badge-green  { background: rgba(110,231,183,.12); color: var(--accent); }
+.badge-yellow { background: rgba(251,191,36,.12);  color: var(--warn); }
+.badge-red    { background: rgba(248,113,113,.12); color: var(--danger); }
+.badge-blue   { background: rgba(129,140,248,.12); color: var(--accent2); }
+
+.tag-live {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: rgba(248,113,113,.15);
+  color: var(--danger);
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: .78rem;
+  font-weight: 600;
+  letter-spacing: .03em;
+}
+.tag-live::before {
+  content: '';
+  width: 7px; height: 7px;
+  background: var(--danger);
+  border-radius: 50%;
+  animation: pulse 1.4s infinite;
+}
+
+.avatar {
+  width: 36px; height: 36px;
+  border-radius: 50%;
+  background: var(--accent2);
+  display: flex; align-items: center; justify-content: center;
+  font-size: .85rem; font-weight: 600; color: #fff; flex-shrink: 0;
+}
+
+.fade-in { animation: fadeIn .35s ease both; }
+
+@keyframes fadeIn  { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
+@keyframes pulse   { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:.5; transform:scale(.7); } }
+@keyframes spin    { to { transform: rotate(360deg); } }
+
+table { width: 100%; border-collapse: collapse; }
+th { text-align:left; font-size:.78rem; font-weight:500; color:var(--muted); padding:0 14px 10px; letter-spacing:.05em; text-transform:uppercase; }
+td { padding:11px 14px; border-top:1px solid var(--border); font-size:.9rem; }
+tr:hover td { background: rgba(255,255,255,.02); }
