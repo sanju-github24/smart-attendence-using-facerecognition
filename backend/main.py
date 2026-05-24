@@ -27,7 +27,8 @@ app.add_middleware(
         "http://localhost:3000",
         "http://localhost:5173",
         "https://smart-attendence-using-facerecognit.vercel.app",       # old/short
-        "https://smart-attendence-using-facerecognition.vercel.app",    # ← add full URL
+        "https://smart-attendence-using-facerecognition.vercel.app",
+        "https://smart-attendence-using-facerecognit.vercel.app"    # ← add full URL
     ],
     allow_credentials=True,
     allow_methods=["*"],
