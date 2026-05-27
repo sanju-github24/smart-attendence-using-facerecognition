@@ -4,11 +4,15 @@ Attendance Routes
 POST /attendance/session/open        — teacher opens session for a class assignment
 POST /attendance/session/close/{id}  — teacher closes session
 GET  /attendance/session/active      — student gets active sessions for their enrolled classes
+GET  /attendance/session/active/{id} — teacher checks if assignment has active session
 POST /attendance/mark                — student marks attendance (IP + face check)
 GET  /attendance/report/{id}         — teacher gets report for an assignment
 GET  /attendance/my                  — student gets their own attendance summary
+POST /attendance/{id}/approve        — teacher approves a flagged attendance
+POST /attendance/{id}/reject         — teacher rejects a flagged attendance
 """
 
+import base64
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
@@ -45,7 +49,6 @@ def open_session(
     if not teacher_profile:
         raise HTTPException(404, "Teacher profile not found")
 
-    # Verify this assignment belongs to this teacher
     assignment = db.query(m.ClassAssignment).filter(
         and_(
             m.ClassAssignment.id         == data.assignment_id,
@@ -80,7 +83,7 @@ def open_session(
     return {
         "session_id"        : session.id,
         "subject"           : assignment.subject.name,
-        "department"            : assignment.department,
+        "department"        : assignment.department,
         "year"              : assignment.year,
         "semester"          : assignment.semester,
         "section"           : assignment.section,
@@ -112,6 +115,31 @@ def close_session(
     return {"message": "Session closed"}
 
 
+# ── Teacher: check active session for an assignment ────────────────────
+
+@router.get("/session/active/{assignment_id}")
+def get_active_session_for_assignment(
+    assignment_id: int,
+    teacher=Depends(require_teacher),
+    db: Session = Depends(get_db),
+):
+    now = datetime.now(timezone.utc)
+    session = db.query(m.AttendanceSession).filter(
+        and_(
+            m.AttendanceSession.assignment_id == assignment_id,
+            m.AttendanceSession.is_active     == True,
+            m.AttendanceSession.expires_at    >  now,
+        )
+    ).first()
+    if not session:
+        return {"active": False}
+    return {
+        "active"    : True,
+        "session_id": session.id,
+        "expires_at": session.expires_at,
+    }
+
+
 # ── Student: get active sessions for enrolled classes ──────────────────
 
 @router.get("/session/active")
@@ -119,17 +147,12 @@ def get_active_sessions(
     current_user=Depends(require_student),
     db: Session = Depends(get_db),
 ):
-    """
-    Returns all currently active sessions for classes the student is enrolled in.
-    Filters strictly by the student's branch + year + semester.
-    """
     student = db.query(m.Student).filter(m.Student.user_id == current_user.id).first()
     if not student:
         raise HTTPException(404, "Student profile not found")
 
     now = datetime.now(timezone.utc)
 
-    # Get all assignment IDs the student is enrolled in
     enrollment_ids = [
         e.assignment_id for e in
         db.query(m.ClassEnrollment).filter(
@@ -140,7 +163,6 @@ def get_active_sessions(
     if not enrollment_ids:
         return []
 
-    # Get active sessions for those assignments
     sessions = db.query(m.AttendanceSession).filter(
         and_(
             m.AttendanceSession.assignment_id.in_(enrollment_ids),
@@ -149,7 +171,6 @@ def get_active_sessions(
         )
     ).all()
 
-    # Check which ones are already marked by this student
     result = []
     for s in sessions:
         already = db.query(m.Attendance).filter(
@@ -160,16 +181,16 @@ def get_active_sessions(
         ).first()
 
         result.append({
-            "session_id"   : s.id,
-            "assignment_id": s.assignment_id,
-            "subject_name" : s.assignment.subject.name,
-            "subject_code" : s.assignment.subject.code,
-            "department"       : s.assignment.department,
-            "year"         : s.assignment.year,
-            "semester"     : s.assignment.semester,
-            "section"      : s.assignment.section,
-            "teacher_name" : s.teacher.user.full_name,
-            "expires_at"   : s.expires_at,
+            "session_id"    : s.id,
+            "assignment_id" : s.assignment_id,
+            "subject_name"  : s.assignment.subject.name,
+            "subject_code"  : s.assignment.subject.code,
+            "department"    : s.assignment.department,
+            "year"          : s.assignment.year,
+            "semester"      : s.assignment.semester,
+            "section"       : s.assignment.section,
+            "teacher_name"  : s.teacher.user.full_name,
+            "expires_at"    : s.expires_at,
             "already_marked": already is not None,
         })
 
@@ -204,7 +225,7 @@ async def mark_attendance(
     if session.expires_at.replace(tzinfo=timezone.utc) < now:
         raise HTTPException(403, "Attendance window has expired")
 
-    # Verify student is enrolled in this class
+    # Verify student is enrolled
     enrollment = db.query(m.ClassEnrollment).filter(
         and_(
             m.ClassEnrollment.student_id    == student_profile.id,
@@ -218,18 +239,13 @@ async def mark_attendance(
             f"Sem{session.assignment.semester})"
         )
 
-    # Branch + year + semester match check
-    if (student_profile.department   != session.assignment.department or
-        student_profile.year     != session.assignment.year   or
-        student_profile.semester != session.assignment.semester):
-        raise HTTPException(403,
-            f"Your class ({student_profile.department} Yr{student_profile.year} "
-            f"Sem{student_profile.semester}) does not match this session "
-            f"({session.assignment.department} Yr{session.assignment.year} "
-            f"Sem{session.assignment.semester})"
-        )
+    # Branch/year/semester match
+    if (student_profile.department != session.assignment.department or
+        student_profile.year       != session.assignment.year       or
+        student_profile.semester   != session.assignment.semester):
+        raise HTTPException(403, "Your class details do not match this session")
 
-    # IP verification
+    # IP check
     student_ip = get_client_ip(request)
     verify_student_ip(student_ip, session.teacher_ip)
 
@@ -243,54 +259,141 @@ async def mark_attendance(
     if already:
         raise HTTPException(409, "You have already marked attendance for this session")
 
-    # Load encrypted embedding
+    # Face embedding record
     face_record = db.query(m.FaceEmbedding).filter(
         m.FaceEmbedding.student_id == student_profile.id
     ).first()
     if not face_record:
         raise HTTPException(500, "Face data missing — please re-register your face")
 
-    # Decode image + portrait blur
-    content = await file.read()
-    bgr     = decode_image(content)
+    # Read and store photo (always, regardless of match result)
+    content   = await file.read()
+    photo_b64 = base64.b64encode(content).decode()
+
+    # Decode image for face processing
+    bgr       = decode_image(content)
     bgr_clean = apply_portrait_blur(bgr)
 
-    # Extract + match face
-    try:
-        live_embedding = extract_embedding(bgr_clean)
-    except ValueError as e:
-        raise HTTPException(422, f"Face detection failed: {e}")
+    is_late = (now - session.started_at.replace(tzinfo=timezone.utc)).seconds > 300
 
+    # ── Face detection ──────────────────────────────────────────────────
+    try:
+        live_embedding = extract_embedding(bgr_clean, strict=True)
+    except ValueError as e:
+        # Face not detected at all — flag immediately, still record
+        record = m.Attendance(
+            session_id     = session_id,
+            student_id     = student_profile.id,
+            status         = "flagged",
+            confidence     = 0.0,
+            student_ip     = student_ip,
+            flagged        = True,
+            flagged_reason = f"Face not detected: {e}",
+            photo_data     = photo_b64,
+            reviewed       = False,
+        )
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        # Tell student only that it's pending — no error details
+        return {
+            "success"       : True,
+            "status"        : "pending_review",
+            "confidence"    : None,
+            "flagged"       : True,
+            "attendance_id" : record.id,
+            "message"       : "Attendance recorded — pending verification",
+        }
+
+    # ── Face matching ───────────────────────────────────────────────────
     is_match, confidence = match_face(live_embedding, face_record.encrypted_data)
 
-    is_late = (now - session.started_at.replace(tzinfo=timezone.utc)).seconds > 300
-    status  = "late" if is_late else "present"
-    flagged = confidence < CONFIDENCE_MIN
+    # Flag if confidence below threshold OR not a match
+    flagged        = (not is_match) or (confidence < CONFIDENCE_MIN)
+    flagged_reason = None
+    if flagged:
+        if not is_match:
+            flagged_reason = "Face mismatch — identity could not be confirmed"
+        elif confidence < CONFIDENCE_MIN:
+            flagged_reason = f"Low confidence match ({confidence:.0%}) — manual review required"
 
-    if not is_match:
-        raise HTTPException(403,
-            f"Face not recognised (confidence: {confidence:.0%}). "
-            "Ensure good lighting and look directly at the camera."
-        )
+    status = "flagged" if flagged else ("late" if is_late else "present")
 
     record = m.Attendance(
-        session_id = session_id,
-        student_id = student_profile.id,
-        status     = status,
-        confidence = confidence,
-        student_ip = student_ip,
-        flagged    = flagged,
+        session_id     = session_id,
+        student_id     = student_profile.id,
+        status         = status,
+        confidence     = round(confidence, 4),
+        student_ip     = student_ip,
+        flagged        = flagged,
+        flagged_reason = flagged_reason,
+        photo_data     = photo_b64,   # always store photo
+        reviewed       = False,
     )
     db.add(record)
     db.commit()
+    db.refresh(record)
 
+    # Never expose confidence or flag reason to student
     return {
-        "success"   : True,
-        "status"    : status,
-        "confidence": round(confidence, 3),
-        "flagged"   : flagged,
-        "message"   : "Attendance marked" + (" (late)" if is_late else ""),
+        "success"       : True,
+        "status"        : "pending_review" if flagged else status,
+        "confidence"    : None if flagged else round(confidence, 3),
+        "flagged"       : flagged,
+        "attendance_id" : record.id,
+        "message"       : "Attendance recorded — pending verification" if flagged else
+                          "Attendance marked" + (" (late)" if is_late else ""),
     }
+
+
+# ── Teacher: approve a flagged attendance ─────────────────────────────
+
+@router.post("/{attendance_id}/approve")
+def approve_attendance(
+    attendance_id: int,
+    teacher=Depends(require_teacher),
+    db: Session = Depends(get_db),
+):
+    teacher_profile = db.query(m.Teacher).filter(m.Teacher.user_id == teacher.id).first()
+
+    att = db.query(m.Attendance).filter(m.Attendance.id == attendance_id).first()
+    if not att:
+        raise HTTPException(404, "Attendance record not found")
+
+    # Verify the session belongs to this teacher
+    if att.session.teacher_id != teacher_profile.id:
+        raise HTTPException(403, "Not your session")
+
+    att.flagged        = False
+    att.reviewed       = True
+    att.review_result  = "approved"
+    att.status         = "present"
+    db.commit()
+    return {"ok": True, "status": "present"}
+
+
+# ── Teacher: reject a flagged attendance ──────────────────────────────
+
+@router.post("/{attendance_id}/reject")
+def reject_attendance(
+    attendance_id: int,
+    teacher=Depends(require_teacher),
+    db: Session = Depends(get_db),
+):
+    teacher_profile = db.query(m.Teacher).filter(m.Teacher.user_id == teacher.id).first()
+
+    att = db.query(m.Attendance).filter(m.Attendance.id == attendance_id).first()
+    if not att:
+        raise HTTPException(404, "Attendance record not found")
+
+    if att.session.teacher_id != teacher_profile.id:
+        raise HTTPException(403, "Not your session")
+
+    att.reviewed      = True
+    att.review_result = "rejected"
+    att.status        = "absent"
+    db.commit()
+    return {"ok": True, "status": "absent"}
 
 
 # ── Teacher: attendance report for an assignment ───────────────────────
@@ -312,24 +415,42 @@ def attendance_report(
     if not assignment:
         raise HTTPException(404, "Assignment not found")
 
-    sessions     = db.query(m.AttendanceSession).filter(
+    sessions       = db.query(m.AttendanceSession).filter(
         m.AttendanceSession.assignment_id == assignment_id
     ).all()
     total_sessions = len(sessions)
     session_ids    = [s.id for s in sessions]
 
-    attendances = db.query(m.Attendance).filter(
+    all_attendances = db.query(m.Attendance).filter(
         m.Attendance.session_id.in_(session_ids)
     ).all() if session_ids else []
 
     # Per-student summary
-    counts: dict[int, dict] = defaultdict(lambda: {"present": 0, "late": 0, "flagged": 0})
-    for a in attendances:
-        counts[a.student_id][a.status] = counts[a.student_id].get(a.status, 0) + 1
-        if a.flagged:
+    counts: dict = defaultdict(lambda: {"present": 0, "late": 0, "flagged": 0, "absent": 0})
+    for a in all_attendances:
+        if a.status in ("present", "late"):
+            counts[a.student_id][a.status] += 1
+        if a.flagged and not a.reviewed:
             counts[a.student_id]["flagged"] += 1
 
-    # All enrolled students (even those with 0 attendance)
+    # Flagged records with photos — for the review panel
+    flagged_records = []
+    for a in all_attendances:
+        if a.flagged and not a.reviewed:
+            flagged_records.append({
+                "attendance_id" : a.id,
+                "student_id"    : a.student_id,
+                "full_name"     : a.student.user.full_name,
+                "roll_number"   : a.student.roll_number,
+                "flagged_reason": a.flagged_reason,
+                "confidence"    : a.confidence,
+                "photo_url"     : f"data:image/jpeg;base64,{a.photo_data}" if a.photo_data else None,
+                "marked_at"     : a.created_at if hasattr(a, "created_at") else None,
+                "reviewed"      : a.reviewed,
+                "review_result" : a.review_result if hasattr(a, "review_result") else None,
+            })
+
+    # All enrolled students
     enrollments = db.query(m.ClassEnrollment).filter(
         m.ClassEnrollment.assignment_id == assignment_id
     ).all()
@@ -340,32 +461,50 @@ def attendance_report(
         c   = counts.get(s.id, {"present": 0, "late": 0, "flagged": 0})
         att = c["present"] + c["late"]
         pct = round(att / total_sessions * 100, 1) if total_sessions > 0 else 0
+
+        # Most recent attendance record for this student (for live view)
+        latest = next(
+            (a for a in sorted(all_attendances, key=lambda x: x.id, reverse=True)
+             if a.student_id == s.id),
+            None
+        )
+
         report.append({
-            "student_id"    : s.id,
-            "roll_number"   : s.roll_number,
-            "full_name"     : s.user.full_name,
-            "department"        : s.department,
-            "year"          : s.year,
-            "semester"      : s.semester,
-            "present"       : c["present"],
-            "late"          : c["late"],
-            "absent"        : total_sessions - att,
-            "attendance_pct": pct,
-            "flagged_count" : c["flagged"],
-            "below_75"      : pct < 75,
+            "attendance_id"  : latest.id if latest else None,
+            "student_id"     : s.id,
+            "roll_number"    : s.roll_number,
+            "full_name"      : s.user.full_name,
+            "department"     : s.department,
+            "year"           : s.year,
+            "semester"       : s.semester,
+            "present"        : c["present"],
+            "late"           : c["late"],
+            "absent"         : total_sessions - att,
+            "attendance_pct" : pct,
+            "flagged_count"  : c["flagged"],
+            "flagged"        : latest.flagged if latest else False,
+            "flagged_reason" : latest.flagged_reason if latest else None,
+            "reviewed"       : latest.reviewed if latest else False,
+            "review_result"  : getattr(latest, "review_result", None),
+            "photo_url"      : f"data:image/jpeg;base64,{latest.photo_data}"
+                               if latest and latest.photo_data else None,
+            "marked_at"      : getattr(latest, "created_at", None),
+            "status"         : latest.status if latest else "absent",
+            "below_75"       : pct < 75,
         })
 
     return {
-        "assignment_id" : assignment_id,
-        "subject"       : assignment.subject.name,
-        "subject_code"  : assignment.subject.code,
-        "department"        : assignment.department,
-        "year"          : assignment.year,
-        "semester"      : assignment.semester,
-        "section"       : assignment.section,
-        "total_sessions": total_sessions,
-        "total_enrolled": len(enrollments),
-        "report"        : sorted(report, key=lambda x: x["roll_number"]),
+        "assignment_id"  : assignment_id,
+        "subject"        : assignment.subject.name,
+        "subject_code"   : assignment.subject.code,
+        "department"     : assignment.department,
+        "year"           : assignment.year,
+        "semester"       : assignment.semester,
+        "section"        : assignment.section,
+        "total_sessions" : total_sessions,
+        "total_enrolled" : len(enrollments),
+        "flagged_records": flagged_records,   # separate list for review panel
+        "report"         : sorted(report, key=lambda x: x["roll_number"]),
     }
 
 
@@ -376,7 +515,6 @@ def my_attendance(
     current_user=Depends(require_student),
     db: Session = Depends(get_db),
 ):
-    """Returns attendance % per enrolled class for the logged-in student."""
     student = db.query(m.Student).filter(m.Student.user_id == current_user.id).first()
     if not student:
         raise HTTPException(404, "Student profile not found")
@@ -388,11 +526,9 @@ def my_attendance(
     result = []
     for e in enrollments:
         a = e.assignment
-        # Total sessions for this assignment
         total = db.query(m.AttendanceSession).filter(
             m.AttendanceSession.assignment_id == a.id
         ).count()
-        # Student's attended sessions
         attended = db.query(m.Attendance).join(m.AttendanceSession).filter(
             and_(
                 m.AttendanceSession.assignment_id == a.id,
@@ -407,12 +543,12 @@ def my_attendance(
             "subject_name" : a.subject.name,
             "subject_code" : a.subject.code,
             "teacher_name" : a.teacher.user.full_name,
-            "department"       : a.department,
+            "department"   : a.department,
             "year"         : a.year,
             "semester"     : a.semester,
             "section"      : a.section,
             "total"        : total,
-            "attended"     : attended,
+            "present"      : attended,
             "pct"          : pct,
             "below_75"     : pct < 75,
         })
@@ -420,7 +556,7 @@ def my_attendance(
     return {
         "student_name": student.user.full_name,
         "roll_number" : student.roll_number,
-        "department"      : student.department,
+        "department"  : student.department,
         "year"        : student.year,
         "semester"    : student.semester,
         "classes"     : result,

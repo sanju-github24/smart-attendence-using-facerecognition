@@ -178,6 +178,13 @@ class Attendance(Base):
     student_ip = Column(String(50))
     marked_at  = Column(DateTime(timezone=True), server_default=func.now())
     flagged    = Column(Boolean, default=False)
+    
+    # ─── ADDED COLUMNS FOR BIOMETRICS & MANUAL REVIEW ──────────────────
+    flagged_reason = Column(String(255), nullable=True)
+    photo_data     = Column(Text, nullable=True)
+    review_result  = Column(String(50), nullable=True)
+    reviewed       = Column(Boolean, default=False)  # <-- ADD THIS LINE
+    # ──────────────────────────────────────────────────────────────────
 
     session = relationship("AttendanceSession", back_populates="attendances")
     student = relationship("Student", back_populates="attendances")

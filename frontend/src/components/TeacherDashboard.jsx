@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { openSession, closeSession, getReport, getActiveSessionForAssignment } from '../api';
 
+const API = import.meta.env?.VITE_API_URL || 'http://localhost:8000';
+
 function initials(name = '') {
   return name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
 }
@@ -22,11 +24,10 @@ function useTimer(active) {
   return `${m}:${s}`;
 }
 
-// Normalise: always use assignment_id regardless of what the API returns
 function normaliseSubject(s) {
   return {
     ...s,
-    assignment_id: s.assignment_id ?? s.id,   // prefer assignment_id, fall back to id
+    assignment_id: s.assignment_id ?? s.id,
     subject_name:  s.subject_name  ?? s.name,
     subject_code:  s.subject_code  ?? s.code,
   };
@@ -44,12 +45,12 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
   const [report, setReport]               = useState(null);
   const [loading, setLoading]             = useState(false);
   const [error, setError]                 = useState('');
+  const [reviewLoading, setReviewLoading] = useState({});
   const timer = useTimer(sessionActive);
 
-  const flagged = attendees.filter(a => a.flagged);
-  const clean   = attendees.filter(a => !a.flagged);
+  const flagged = attendees.filter(a => a.flagged && !a.reviewed);
+  const clean   = attendees.filter(a => !a.flagged || a.reviewed);
 
-  // Check for existing active session when switching subjects
   useEffect(() => {
     if (!activeSubject?.assignment_id) return;
     setAttendees([]);
@@ -68,39 +69,34 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
       .catch(() => {});
   }, [activeSubject?.assignment_id]);
 
-  // Poll attendance every 5s during active session
+  // Poll attendance every 5s
   useEffect(() => {
     if (!sessionActive || !activeSubject?.assignment_id) return;
     const interval = setInterval(async () => {
       try {
         const data = await getReport(token, activeSubject.assignment_id);
         const raw  = data.report || data.attendees || [];
-        setAttendees(raw.map(r => {
-          const confidence = r.confidence !== undefined ? r.confidence : 0.95;
-          let status = 'absent';
-          if (r.status === 'present' || r.present > 0) status = 'present';
-          else if (r.status === 'late' || r.late > 0)  status = 'late';
-          return {
-            id:         r.student_id || r.id,
-            name:       r.full_name || r.student_name || 'Unknown',
-            roll:       r.roll_number || r.roll || '—',
-            status,
-            confidence,
-            flagged:    r.flagged || r.flagged_count > 0 || confidence < 0.70,
-            time:       r.marked_at ? new Date(r.marked_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—',
-            photoUrl:   r.photo_url || null,
-          };
-        }));
+        setAttendees(raw.map(r => ({
+          id:             r.student_id || r.id,
+          attendance_id:  r.attendance_id || r.id,
+          name:           r.full_name || r.student_name || 'Unknown',
+          roll:           r.roll_number || r.roll || '—',
+          status:         r.status || 'present',
+          confidence:     r.confidence ?? null,
+          flagged:        r.flagged || false,
+          flagged_reason: r.flagged_reason || '',
+          reviewed:       r.reviewed || false,
+          review_result:  r.review_result || null,
+          time:           r.marked_at ? new Date(r.marked_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—',
+          photoUrl:       r.photo_url || null,
+        })));
       } catch {}
     }, 5000);
     return () => clearInterval(interval);
   }, [sessionActive, activeSubject?.assignment_id, token]);
 
   async function handleOpenSession() {
-    if (!activeSubject?.assignment_id) {
-      setError('No class selected or assignment ID missing.');
-      return;
-    }
+    if (!activeSubject?.assignment_id) { setError('No class selected.'); return; }
     setLoading(true); setError('');
     try {
       const data = await openSession(token, activeSubject.assignment_id, duration);
@@ -127,6 +123,27 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
     } catch {}
   }
 
+  async function handleReview(attendanceId, action) {
+    setReviewLoading(prev => ({ ...prev, [attendanceId]: action }));
+    try {
+      const res = await fetch(`${API}/attendance/${attendanceId}/${action}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new Error('Review failed');
+      // Update local state immediately
+      setAttendees(prev => prev.map(a =>
+        a.attendance_id === attendanceId
+          ? { ...a, reviewed: true, review_result: action === 'approve' ? 'approved' : 'rejected', flagged: false, status: action === 'approve' ? 'present' : 'absent' }
+          : a
+      ));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setReviewLoading(prev => ({ ...prev, [attendanceId]: null }));
+    }
+  }
+
   return (
     <div style={{ minHeight: '100vh', display: 'flex' }}>
       {/* Sidebar */}
@@ -151,11 +168,8 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
         <div style={{ padding: '16px 12px', flex: 1 }}>
           <p style={{ fontSize: '.72rem', color: 'var(--muted)', fontWeight: 500, letterSpacing: '.08em', textTransform: 'uppercase', padding: '0 8px', marginBottom: 10 }}>My Classes</p>
           {normSubjects.map(s => (
-            <button
-              key={s.assignment_id}
-              onClick={() => setActiveSubject(s)}
-              style={{ width: '100%', textAlign: 'left', background: activeSubject?.assignment_id === s.assignment_id ? 'rgba(129,140,248,.12)' : 'transparent', border: 'none', borderRadius: 10, padding: '10px 12px', marginBottom: 4, color: activeSubject?.assignment_id === s.assignment_id ? 'var(--accent2)' : 'var(--text)', cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 3 }}
-            >
+            <button key={s.assignment_id} onClick={() => setActiveSubject(s)}
+              style={{ width: '100%', textAlign: 'left', background: activeSubject?.assignment_id === s.assignment_id ? 'rgba(129,140,248,.12)' : 'transparent', border: 'none', borderRadius: 10, padding: '10px 12px', marginBottom: 4, color: activeSubject?.assignment_id === s.assignment_id ? 'var(--accent2)' : 'var(--text)', cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 3 }}>
               <span style={{ fontWeight: 500, fontSize: '.88rem' }}>{s.subject_name}</span>
               <span style={{ fontSize: '.72rem', color: 'var(--muted)', fontFamily: 'DM Mono' }}>{s.subject_code}</span>
               <span style={{ fontSize: '.7rem', color: 'var(--muted)' }}>
@@ -163,9 +177,7 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
               </span>
             </button>
           ))}
-          {normSubjects.length === 0 && (
-            <p style={{ fontSize: '.83rem', color: 'var(--muted)', padding: '8px' }}>No classes assigned yet</p>
-          )}
+          {normSubjects.length === 0 && <p style={{ fontSize: '.83rem', color: 'var(--muted)', padding: '8px' }}>No classes assigned yet</p>}
         </div>
 
         <div style={{ padding: '16px 12px' }}>
@@ -185,9 +197,7 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
             {/* Header */}
             <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 28 }}>
               <div>
-                <h1 style={{ fontSize: '1.5rem', fontWeight: 600, letterSpacing: '-.02em' }}>
-                  {activeSubject.subject_name}
-                </h1>
+                <h1 style={{ fontSize: '1.5rem', fontWeight: 600, letterSpacing: '-.02em' }}>{activeSubject.subject_name}</h1>
                 <p style={{ color: 'var(--muted)', fontSize: '.88rem', marginTop: 4 }}>
                   <span style={{ fontFamily: 'DM Mono' }}>{activeSubject.subject_code}</span>
                   {' · '}{activeSubject.department}
@@ -199,17 +209,15 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
               {sessionActive && <div className="tag-live">LIVE — {timer}</div>}
             </div>
 
-            {error && (
-              <div style={{ background: 'rgba(248,113,113,.1)', border: '1px solid rgba(248,113,113,.3)', color: 'var(--danger)', padding: '10px 14px', borderRadius: 10, marginBottom: 20, fontSize: '.875rem' }}>{error}</div>
-            )}
+            {error && <div style={{ background: 'rgba(248,113,113,.1)', border: '1px solid rgba(248,113,113,.3)', color: 'var(--danger)', padding: '10px 14px', borderRadius: 10, marginBottom: 20, fontSize: '.875rem' }}>{error}</div>}
 
             {/* Stats */}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 28 }}>
               {[
-                { label: 'Present', value: clean.filter(a => a.status === 'present').length, color: 'var(--accent)' },
-                { label: 'Late',    value: clean.filter(a => a.status === 'late').length,    color: 'var(--warn)' },
-                { label: 'Review',  value: flagged.length,                                    color: 'var(--danger)' },
-                { label: 'Total',   value: attendees.length,                                  color: 'var(--accent2)' },
+                { label: 'Present', value: attendees.filter(a => a.status === 'present').length, color: 'var(--accent)' },
+                { label: 'Pending Review', value: flagged.length, color: 'var(--danger)' },
+                { label: 'Reviewed', value: attendees.filter(a => a.reviewed).length, color: 'var(--warn)' },
+                { label: 'Total', value: attendees.length, color: 'var(--accent2)' },
               ].map(stat => (
                 <div key={stat.label} className="card" style={{ padding: '18px' }}>
                   <div style={{ fontSize: '1.9rem', fontWeight: 600, color: stat.color, fontFamily: 'DM Mono' }}>{stat.value}</div>
@@ -223,15 +231,11 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
               <div className="card" style={{ marginBottom: 24, display: 'flex', alignItems: 'center', gap: 18, flexWrap: 'wrap' }}>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontWeight: 500, marginBottom: 4 }}>Start Attendance Session</div>
-                  <div style={{ fontSize: '.85rem', color: 'var(--muted)' }}>
-                    Only enrolled students · IP + face verified
-                  </div>
+                  <div style={{ fontSize: '.85rem', color: 'var(--muted)' }}>Face mismatches are auto-flagged for your review</div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                   <select value={duration} onChange={e => setDuration(Number(e.target.value))} style={{ width: 140 }}>
-                    {[5, 10, 15, 30, 60].map(d => (
-                      <option key={d} value={d}>{d} minutes</option>
-                    ))}
+                    {[5, 10, 15, 30, 60].map(d => <option key={d} value={d}>{d} minutes</option>)}
                   </select>
                   <button className="btn-accent" onClick={handleOpenSession} disabled={loading}>
                     {loading ? 'Starting…' : '▶ Start Session'}
@@ -243,7 +247,7 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
               <div className="card" style={{ marginBottom: 24, display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, background: 'rgba(248,113,113,.04)', borderColor: 'rgba(248,113,113,.2)' }}>
                 <div>
                   <div style={{ fontWeight: 500, marginBottom: 2 }}>Session in progress</div>
-                  <div style={{ fontSize: '.85rem', color: 'var(--muted)' }}>Students can mark attendance · polling every 5s</div>
+                  <div style={{ fontSize: '.85rem', color: 'var(--muted)' }}>Face mismatches auto-flagged · polling every 5s</div>
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                   <div style={{ fontFamily: 'DM Mono', fontSize: '1.7rem', color: 'var(--danger)', fontWeight: 500 }}>{timer}</div>
@@ -252,16 +256,17 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
               </div>
             )}
 
-            {/* Tab toggle */}
+            {/* Tabs */}
             <div style={{ display: 'flex', gap: 8, marginBottom: 20 }}>
               {['attendance', 'review', 'report'].map(v => (
                 <button key={v} onClick={() => { setView(v); if (v === 'report') loadReport(); }}
                   style={{ padding: '8px 18px', borderRadius: 10, border: '1px solid var(--border)', fontSize: '.875rem', background: view === v ? 'var(--surface2)' : 'transparent', color: view === v ? 'var(--text)' : 'var(--muted)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}>
-                  {v === 'attendance' && `Attendance (${clean.length})`}
+                  {v === 'attendance' && `Attendance (${attendees.filter(a => !a.flagged || a.reviewed).length})`}
                   {v === 'review' && (
-                    <>Needs Review {flagged.length > 0 && (
-                      <span style={{ background: 'var(--danger)', color: '#fff', borderRadius: 20, padding: '1px 7px', fontSize: '.72rem' }}>{flagged.length}</span>
-                    )}</>
+                    <>
+                      Needs Review
+                      {flagged.length > 0 && <span style={{ background: 'var(--danger)', color: '#fff', borderRadius: 20, padding: '1px 7px', fontSize: '.72rem' }}>{flagged.length}</span>}
+                    </>
                   )}
                   {v === 'report' && 'Full Report'}
                 </button>
@@ -281,7 +286,6 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
                       <th style={{ paddingLeft: 22 }}>Student</th>
                       <th>Roll No.</th>
                       <th>Status</th>
-                      <th>Confidence</th>
                       <th>Time</th>
                     </tr></thead>
                     <tbody>
@@ -290,19 +294,18 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
                           <td style={{ paddingLeft: 22 }}>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                               <div className="avatar" style={{ width: 32, height: 32, fontSize: '.78rem' }}>{initials(a.name)}</div>
-                              <span style={{ fontWeight: 500 }}>{a.name}</span>
+                              <div>
+                                <div style={{ fontWeight: 500 }}>{a.name}</div>
+                                {a.reviewed && (
+                                  <div style={{ fontSize: '.7rem', color: a.review_result === 'approved' ? 'var(--accent)' : 'var(--danger)' }}>
+                                    {a.review_result === 'approved' ? '✓ Teacher approved' : '✗ Teacher rejected'}
+                                  </div>
+                                )}
+                              </div>
                             </div>
                           </td>
                           <td><span style={{ fontFamily: 'DM Mono', color: 'var(--muted)', fontSize: '.83rem' }}>{a.roll}</span></td>
-                          <td><span className={`badge ${a.status === 'present' ? 'badge-green' : 'badge-yellow'}`}>{a.status}</span></td>
-                          <td>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                              <div style={{ width: 70, height: 4, background: 'var(--border)', borderRadius: 4 }}>
-                                <div style={{ height: '100%', borderRadius: 4, width: `${(a.confidence || 0) * 100}%`, background: (a.confidence || 0) > 0.8 ? 'var(--accent)' : 'var(--warn)' }} />
-                              </div>
-                              <span style={{ fontFamily: 'DM Mono', fontSize: '.8rem', color: 'var(--muted)' }}>{((a.confidence || 0) * 100).toFixed(0)}%</span>
-                            </div>
-                          </td>
+                          <td><span className={`badge ${a.status === 'present' ? 'badge-green' : 'badge-red'}`}>{a.status}</span></td>
                           <td style={{ color: 'var(--muted)', fontSize: '.85rem' }}>{a.time}</td>
                         </tr>
                       ))}
@@ -312,37 +315,75 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
               </div>
             )}
 
-            {/* Review panel */}
+            {/* ── REVIEW PANEL — photo + approve/reject ── */}
             {view === 'review' && (
               <div className="fade-in">
                 {flagged.length === 0 ? (
-                  <div className="card" style={{ padding: '52px', textAlign: 'center', color: 'var(--muted)' }}>✓ No flagged entries — all confident face matches</div>
+                  <div className="card" style={{ padding: '52px', textAlign: 'center', color: 'var(--muted)' }}>
+                    ✓ No pending flags — all face matches are confident
+                  </div>
                 ) : (
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 16 }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 16 }}>
                     {flagged.map(a => (
-                      <div key={a.id} className="card fade-in" style={{ borderColor: 'rgba(248,113,113,.25)' }}>
-                        <div style={{ background: 'var(--surface2)', borderRadius: 10, height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: 16, position: 'relative', overflow: 'hidden' }}>
-                          {a.photoUrl
-                            ? <img src={a.photoUrl} alt={a.name} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
-                            : (
-                              <>
-                                <div style={{ position: 'absolute', inset: 0, background: 'radial-gradient(circle at 50% 40%, rgba(129,140,248,.15), transparent 70%)' }} />
-                                <div style={{ width: 64, height: 64, borderRadius: '50%', background: 'linear-gradient(135deg,var(--accent2),var(--accent))', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.6rem', fontWeight: 700, color: '#fff', zIndex: 1 }}>{initials(a.name)}</div>
-                              </>
-                            )}
-                          <div style={{ position: 'absolute', top: 10, right: 10 }}><span className="badge badge-red">Low confidence</span></div>
-                        </div>
-                        <div style={{ fontWeight: 600, marginBottom: 4 }}>{a.name}</div>
-                        <div style={{ fontFamily: 'DM Mono', fontSize: '.8rem', color: 'var(--muted)', marginBottom: 14 }}>{a.roll}</div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
-                          <div style={{ flex: 1, height: 5, background: 'var(--border)', borderRadius: 4 }}>
-                            <div style={{ height: '100%', borderRadius: 4, width: `${(a.confidence || 0) * 100}%`, background: 'var(--danger)' }} />
+                      <div key={a.id} className="card fade-in" style={{ borderColor: 'rgba(248,113,113,.3)', padding: 0, overflow: 'hidden' }}>
+
+                        {/* Photo — actual capture from attendance attempt */}
+                        <div style={{ position: 'relative', height: 200, background: '#0a0a0f' }}>
+                          {a.photoUrl ? (
+                            <img
+                              src={a.photoUrl}
+                              alt={`${a.name} attendance photo`}
+                              style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                            />
+                          ) : (
+                            <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 8, color: 'var(--muted)' }}>
+                              <div style={{ width: 56, height: 56, borderRadius: '50%', background: 'linear-gradient(135deg,var(--accent2),var(--accent))', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '1.4rem', fontWeight: 700, color: '#fff' }}>{initials(a.name)}</div>
+                              <span style={{ fontSize: '.75rem' }}>No photo captured</span>
+                            </div>
+                          )}
+
+                          {/* Flag badge */}
+                          <div style={{ position: 'absolute', top: 10, left: 10 }}>
+                            <span style={{ background: 'rgba(248,113,113,.9)', color: '#fff', fontSize: '.7rem', fontWeight: 700, padding: '3px 9px', borderRadius: 6 }}>
+                              ⚑ FLAGGED
+                            </span>
                           </div>
-                          <span style={{ fontFamily: 'DM Mono', fontSize: '.85rem', color: 'var(--danger)' }}>{((a.confidence || 0) * 100).toFixed(0)}%</span>
+
+                          {/* Time */}
+                          <div style={{ position: 'absolute', bottom: 10, right: 10, background: 'rgba(0,0,0,.7)', color: '#fff', fontSize: '.7rem', padding: '2px 8px', borderRadius: 5 }}>
+                            {a.time}
+                          </div>
                         </div>
-                        <div style={{ display: 'flex', gap: 8 }}>
-                          <button className="btn-success" style={{ flex: 1, fontSize: '.83rem' }}>✓ Approve</button>
-                          <button className="btn-danger"  style={{ flex: 1, fontSize: '.83rem' }}>✗ Reject</button>
+
+                        {/* Info */}
+                        <div style={{ padding: '14px 16px' }}>
+                          <div style={{ fontWeight: 600, fontSize: '.95rem', marginBottom: 2 }}>{a.name}</div>
+                          <div style={{ fontFamily: 'DM Mono', fontSize: '.78rem', color: 'var(--muted)', marginBottom: 8 }}>{a.roll}</div>
+
+                          {/* Reason */}
+                          {a.flagged_reason && (
+                            <div style={{ fontSize: '.75rem', background: 'rgba(248,113,113,.08)', border: '1px solid rgba(248,113,113,.2)', color: '#f87171', padding: '6px 10px', borderRadius: 7, marginBottom: 12 }}>
+                              {a.flagged_reason}
+                            </div>
+                          )}
+
+                          {/* Approve / Reject */}
+                          <div style={{ display: 'flex', gap: 8 }}>
+                            <button
+                              onClick={() => handleReview(a.attendance_id, 'approve')}
+                              disabled={!!reviewLoading[a.attendance_id]}
+                              style={{ flex: 1, background: reviewLoading[a.attendance_id] === 'approve' ? '#15803d' : '#16a34a', color: '#fff', border: 'none', borderRadius: 8, padding: '10px', fontSize: '.83rem', fontWeight: 600, cursor: 'pointer' }}
+                            >
+                              {reviewLoading[a.attendance_id] === 'approve' ? '…' : '✓ Approve'}
+                            </button>
+                            <button
+                              onClick={() => handleReview(a.attendance_id, 'reject')}
+                              disabled={!!reviewLoading[a.attendance_id]}
+                              style={{ flex: 1, background: reviewLoading[a.attendance_id] === 'reject' ? '#b91c1c' : '#dc2626', color: '#fff', border: 'none', borderRadius: 8, padding: '10px', fontSize: '.83rem', fontWeight: 600, cursor: 'pointer' }}
+                            >
+                              {reviewLoading[a.attendance_id] === 'reject' ? '…' : '✗ Reject'}
+                            </button>
+                          </div>
                         </div>
                       </div>
                     ))}
@@ -362,8 +403,8 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
                   <thead><tr>
                     <th style={{ paddingLeft: 22 }}>Student</th>
                     <th>Present</th>
-                    <th>Late</th>
                     <th>Absent</th>
+                    <th>Flagged</th>
                     <th>Attendance %</th>
                     <th>Status</th>
                   </tr></thead>
@@ -377,8 +418,8 @@ export default function TeacherDashboard({ user, token, subjects, onLogout }) {
                           </div>
                         </td>
                         <td style={{ color: 'var(--accent)',  fontFamily: 'DM Mono' }}>{r.present}</td>
-                        <td style={{ color: 'var(--warn)',    fontFamily: 'DM Mono' }}>{r.late}</td>
                         <td style={{ color: 'var(--danger)',  fontFamily: 'DM Mono' }}>{r.absent}</td>
+                        <td style={{ color: 'var(--warn)',    fontFamily: 'DM Mono' }}>{r.flagged_count ?? 0}</td>
                         <td>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                             <div style={{ width: 60, height: 4, background: 'var(--border)', borderRadius: 4 }}>
